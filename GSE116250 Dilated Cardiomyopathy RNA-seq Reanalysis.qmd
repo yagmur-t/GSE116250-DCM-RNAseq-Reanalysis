@@ -1,0 +1,572 @@
+---
+title: "GSE116250 Dilated Cardiomyopathy RNA-seq Reanalysis"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    theme: flatly
+editor: visual
+execute:
+  echo: true
+  message: false
+  warning: false
+---
+
+## Introduction
+
+This document contains a reanalysis of the publicly available RNA sequencing (RNA-seq) data from Sweet et al. 2018 (BMC Genomics, GSE116250). The study profiled gene expression in human left ventricular tissue from non-failing donor hearts (NF) and patients with dilated cardiomyopathy (DCM), a condition where the heart muscle weakens and the left ventricle enlarges, reducing its ability to pump blood efficiently. The original study used an older analytic pipeline. This reanalysis applies a more up to date workflow to a subset of the data, comparing six NF and six DCM samples.
+
+## Methods Summary
+
+Raw sequencing data was retrieved directly from NCBI's Sequence Read Archive using the accession numbers linked to the GSE116250 data set. All upstream processing was performed using Galaxy Project (usegalaxy.org).
+
+The processing steps on Galaxy Project were as follows:
+
+-   Quality Control: FastQC and MultiQC were used to assess raw read quality. All 12 samples showed Phred quality scores \> 32 across all read positions, no adapter contamination, and consistent GC content (47-49%). Trimming was not needed as the data quality was sufficient for alignment.
+
+-   Mitochondrial Read Removal: Cardiac tissue contains an exceptionally high amounts of mitochondrial transcripts due to the high energy requirements of cardiomyocytes. Prior to alignment, samtools was used to remove reads mapping to the mitochondrial chromosome (chrM), consistent with the approach used by the original authors. Between 36-45% of mapped reads per sample were mitochondrial, confirming the importance of this step for cardiac RNA-seq data analysis.
+
+-   Alignment: Reads were aligned to the human reference genome GRCh38 using HISAT2., keeping in mind that the sample library was prepared using the TruSeq Stranded mRNA kit which produces reverse-stranded libraries. Alignment rates across all 12 samples ranged from 97-99%.
+
+-   Gene Quantification: featureCounts was used to count how many reads from each sample mapped to each gene, using the Ensembl GRCh38 release 96 annotation.
+
+Downstream statistical analysis and visualization were performed in RStudio using R (as follows). The original paper aligned reads to GRCh37 using gSNAP and quantified expression as RPKM using Cufflinks. This reanalysis uses GRCh38 and raw integer counts as input to DESeq2, which is the current standard approach for differential expression analysis and is statistically more appropriate for count-based data compared to RPKM-based methods.
+
+```{r}
+#| label: libraries
+
+library(DESeq2)
+library(tidyverse)
+library(pheatmap)
+library(ggrepel)
+library(RColorBrewer)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(EnhancedVolcano)
+library(here)
+```
+
+```{r}
+#| label: data_import
+
+# Define path to counts folder
+count_files <- list.files(here("data","counts"), pattern = ".tabular", full.names = TRUE)
+
+# Obtain sample names from filenames
+sample_names <- basename(count_files) %>% str_remove(".tabular")
+
+# Read all count files and combune them into one matrix
+counts_list <- lapply(count_files, function(file) {read.table(file, header= TRUE, row.names = 1)})
+  
+# Combine into a dataframe
+counts_matrix <- do.call(cbind, counts_list)
+
+#Assign sample names as column names
+colnames(counts_matrix) <- sample_names
+
+#Preview 
+dim(counts_matrix)
+head(counts_matrix)
+```
+
+```{r}
+#| label: metadata_import
+
+metadata <- read.csv(here("data", "metadata.csv"), row.names = 1)
+
+# Confirmation
+all(colnames(counts_matrix) == rownames(metadata))
+```
+
+```{r}
+#| label: filtering
+
+# Keep genes with at least 10 counts in at least 6 samples
+
+keep <- rowSums(counts_matrix >=10) >= 6
+counts_filtered <- counts_matrix[keep, ]
+
+# Number of genes remaining after filtering
+cat("Genes before filtering:", nrow(counts_matrix), "\n")
+cat("Genes after filtering:", nrow(counts_filtered), "\n")
+cat("Genes removed:", nrow(counts_matrix) - nrow(counts_filtered), "\n")
+
+```
+
+## Differential Expression Analysis
+
+Differential expression analysis was performed using DESeq2. The statistical model included age and sex as co-variates alongside disease condition, consistent with the original paper's approach. Results were filtered using the following two criteria: adjusted p-value \< 0.05 and absolute log2FoldChange \>1 (equivalent to a two-fold difference in expression). The absolute log2FoldChange threshold was applied as a biological significance filter, ensuring that only genes with a meaningful change were taken into consideration.
+
+834 genes were upregulated and 822 genes were downregulated in DCM samples compared to NF hearts (padj \< 0.05). Applying the additional fold change filter identified 680 high-confidence differentially expressed genes (DEGs).
+
+```{r}
+#| label: deseq2_setup
+
+# Convert condition and sex to factors
+metadata$condition <- factor(metadata$condition, levels = c("NF", "DCM"))
+metadata$sex <- factor(metadata$sex)
+
+# DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_filtered,
+  colData = metadata,
+  design = ~ age + sex + condition
+)
+
+```
+
+```{r}
+#| label: run_deseq2
+
+dds <- DESeq(dds)
+
+# Extract results
+results <- results(dds,
+                   name= "condition_DCM_vs_NF",
+                                alpha = 0.05)
+
+# Summary
+summary(results)
+```
+
+```{r}
+#| label: results_dataframe
+
+# Convert the results into a dataframe and add the gene ID column
+
+results_df <- as.data.frame(results) %>%
+  rownames_to_column("gene_id") %>%
+  arrange(padj)
+
+# How many genes meet both padj < 0.05 and fold change > 1
+
+sig_genes <- results_df %>%
+  filter(padj < 0.05, abs(log2FoldChange) > 1)
+
+cat("Significant DEGs (padj < 0.05 and |log2FC| > 1):", nrow(sig_genes), "\n")
+
+```
+
+```{r}
+#| label: gene_symbols
+
+# Ensebl IDs to gene symbols
+gene_symbols <- bitr(results_df$gene_id,
+                     fromType = "ENSEMBL",
+                     toType = "SYMBOL",
+                     OrgDb = "org.Hs.eg.db")
+
+# Add symbols into the results_df
+results_df <- results_df %>%
+  left_join(gene_symbols, by = c("gene_id" = "ENSEMBL"))
+```
+
+## Quality Control - PCA
+
+Before interpreting the differential expression results, principal component analysis (PCA) was performed on variance-stabilized counts to assess whether the samples behaved as expected. PC1 (38% variance) separated NF from DCM samples, confirming disease condition is the primary driver of gene expression in this data set. PC2 (15% of variance) separated male from female samples, indicating that sex contributes to gene expression variability. Age showed no clear association. These findings supported the inclusion of sex as a co-variate in the DESeq2 statistical model, ensuring its effect was accounted for before testing for disease-related differences. No samples required exclusion.
+
+```{r}
+#| label: pca_plot
+
+# Variance stabilizing transformation
+vsd <- vst(dds, blind = TRUE)
+
+# PCA data
+pca_data <- plotPCA(vsd, intgroup = "condition", returnData = TRUE)
+percent_var <- round(100 * attr(pca_data, "percentVar"))
+
+# Plot
+ggplot(pca_data, aes(x = PC1, y = PC2, color = condition, label = name)) + 
+  geom_point(size = 4, alpha = 0.8) + 
+  geom_text_repel(size = 3, max.overlaps = 20) + 
+  scale_color_manual(values = c("NF" = "#4DBBD5", "DCM" = "#E64B35")) + 
+  labs(
+    title = "PCA of Variance Stabilized Counts",
+    subtitle = "GSE116250 - NF vs DCM (n = 12)",
+    x = paste0("PC1: ", percent_var[1], "% variance"),
+    y = paste0("PC2: ", percent_var[2], "% variance"),
+    color = "Condition"
+    ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend_position = "right"
+    )
+
+ggsave(here("results", "figures", "pca_condition.png"),
+       width = 10, height = 7, dpi = 300)
+```
+
+```{r}
+#| label: pca_detailed
+
+# PCA colored by sex
+pca_sex <- ggplot(pca_data, aes(x = PC1, y = PC2, color = sex, label = name)) + 
+  geom_point(size = 4, alpha = 0.8) + 
+  geom_text_repel(size = 3, max.overlaps = 20) + 
+  labs(
+    title = "PCA Colored by Sex",
+    x = paste0("PC1: ", percent_var[1], "% variance"),
+    y = paste0("PC2: ", percent_var[2], "% variance"),
+    color = "Sex"
+    ) +
+  theme_classic()
+
+ggsave(here("results", "figures", "pca_sex.png"),
+       width = 10, height = 7, dpi = 300)
+
+# PCA colored by age
+
+pca_age <- ggplot(pca_data, aes(x = PC1, y = PC2, color = age, label = name)) + 
+  geom_point(size = 4, alpha = 0.8) + 
+  geom_text_repel(size = 3, max.overlaps = 20) + 
+  scale_color_gradient(low = "#4DBBD5", high = "#E64B35") + 
+  labs(
+    title = "PCA Colored by Age",
+    x = paste0("PC1: ", percent_var[1], "% variance"),
+    y = paste0("PC2: ", percent_var[2], "% variance"),
+    color = "Condition"
+    ) +
+  theme_classic()
+
+ggsave(here("results", "figures", "pca_age.png"),
+       width = 10, height = 7, dpi = 300)
+
+# Display both
+pca_sex
+pca_age
+
+
+```
+
+## Volcano Plot
+
+Genes meeting both significance thresholds (padj \< 0.05, abs(log2FoldChange) \> 1) are highlighted in red (up regulated in DCM) or blue (downregulated in DCM). Genes not meeting both criteria are shown in gray.
+
+Among the most significantly upregulated genes, PCOLCE2 and PI16 stood out the most. Both are involved in extracellular matrix (ECM) re-modelling, a process where the structural scaffolding of the heart changes in response to disease. DUSP15, a regulator of cell stress signalling, and UNC80, which is involved in ion channel function, were also upregulated.
+
+Among the most significantly down regulated genes, MYH6, which encodes a key contractile protein in heart muscles, was the most notable finding. MYH6 down regulation in heart failure is one of the most consistently reported finding in cardiac transcriptomics research, and its appearance here serves as an important internal validation that the pipeline is in accordance with cardiac biology. BMP7, an anti-fibriotic signalling protein, and HOOK1, a cytoskeletal linker, were also among the top downregulated genes.
+
+```{r}
+#| label: volcano_plot
+
+# Data preparation
+volcano_data <- results_df %>%
+  filter(!is.na(padj)) %>%
+  mutate(
+    significance = case_when(
+      padj < 0.05 & log2FoldChange > 1 ~ "Upregulated in DCM",
+      padj < 0.05 & log2FoldChange < -1 ~ "Downregulated in DCM",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+# Count each category for the plot subtitle
+n_up <- sum(volcano_data$significance == "Upregulated in DCM")
+n_down <- sum(volcano_data$significance == "Downregulated in DCM")
+n_ns <- sum(volcano_data$significance == "Not Significant")
+
+# Plot
+ggplot(volcano_data,
+       aes(x = log2FoldChange,
+           y = -log10(padj),
+           color = significance)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c(
+    "Upregulated in DCM" = "#E64B35",
+    "Downregulated in DCM" = "#4DBBD5",
+    "Not Significant" = "grey70"
+  )) +
+  geom_vline(xintercept = c(-1, 1),
+             linetype = "dashed",
+             alpha = 0.5) +
+  geom_text_repel(
+    data = volcano_data %>%
+      filter(significance != "Not Significant") %>%
+      arrange(padj) %>%
+      slice_head(n = 20),
+    aes(label = SYMBOL),
+    size = 3,
+    max.overlaps = 20,
+    box.padding = 0.5,
+  ) +
+  labs(
+    title = "Differential Gene Expression - DCM vs NF",
+    subtitle = paste0("Up: ", n_up, " | Down: ", n_down, " | Not Significant: ", n_ns),
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Expression"
+  ) +
+  theme_classic() +
+  theme(
+    plot.subtitle = element_text(size = 11, color = "grey40"),
+    legend.position = "right"
+  )
+
+ggsave(here("results", "figures", "volcano_plot.png"),
+       width = 10, height = 7, dpi = 300)
+```
+
+## Heat Map Analysis
+
+The heat map displays the expression patterns of the top 50 DEGs across all 12 samples. Scaling is applied per gene so that the expression patterns are comparable regardless of absolute expression levels, which can vary widely between genes.
+
+Two distinct gene blocks are visible in the heat map: genes consistently more expressed in DCM and genes consistently more expressed in NF. This pattern confirms the PCA and DESeq2 findings and demonstrates that the differential expression is consistent across individual replicates within each group.
+
+```{r}
+#| label: heatmap
+
+# 50 significant DEGs by adjusted p-value
+top50_genes <- results_df %>%
+  filter(padj < 0.05, abs(log2FoldChange) >1) %>%
+  arrange(padj) %>%
+  slice_head(n = 50) %>%
+  pull(gene_id)
+
+# Variance stabilized counts for those 50 genes
+mat <- assay(vsd)[top50_genes, ]
+
+# Scale across rows so that color represents relative expression
+mat_scaled <- t(scale(t(mat)))
+
+# Replace Ensembl IDs with gene symbols where applicable
+gene_symbol_map <- results_df %>%
+  filter(gene_id %in% top50_genes) %>%
+  dplyr::select(gene_id, SYMBOL) %>%
+  mutate(label = ifelse(is.na(SYMBOL), gene_id, SYMBOL))
+
+rownames(mat_scaled) <- gene_symbol_map$label[match(rownames(mat_scaled), gene_symbol_map$gene_id)]
+
+# Annotation bar for sample conditions
+annotation_col <- data.frame(
+  Condition = metadata$condition,
+  Sex = metadata$sex,
+  row.names = rownames(metadata)
+)
+
+# Colors for annotations
+annotation_colors <- list(
+  Condition = c("NF" = "#4DBBD5", "DCM" = "#E64B35"),
+  Sex = c("Female" = "#FF69B4", "Male" = "#4169E1")
+)
+
+# Plot heatmap & save figure
+heatmap_plot <- pheatmap(mat_scaled,
+         annotation_col = annotation_col,
+         annotation_colors = annotation_colors,
+         show_colnames = FALSE,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         color = colorRampPalette(c("#7B2D8B", "white", "#FF8C00"))(100),
+         main = "Top 50 DEGs - DCM vs NF",
+         fontsize_row = 8,
+         border_color = NA)
+
+ggsave(here("results", "figures", "heatmap.png"),
+       plot = heatmap_plot,
+       width = 10, height = 7, dpi = 300,
+       bg = "white")
+```
+
+## Pathway Enrichment Analysis - GO
+
+The Gene Ontology (GO) enrichment analysis tests whether genes belonging to a particular biological process appear more frequently in the DEG list than would be expected by chance. Analysis was performed separately for upregulated and downregulated genes using clusterProfiler.
+
+Among the upregulated genes, extracellular matrix organization was the most significantly enriched biological process, driven by genes such as PCOLCE2 and PI16. This points to the well-established feature of the disease where the healthy cardiac muscle tissue is progressively replaced by the collagen-rich scar tissue, reducing the heart's ability to contract efficiently.
+
+For the downregulated genes, the analysis returned two enriched processes: *in utero* embryonic development and mesenchymal cell proliferation (padj \< 0.01). The stricter threshold of 0.05 returned no significant processes, which is expected given the data set is small. With a smaller data set, genuine signals can fall just short of the threshold. Therefore the threshold was relaxed. The genes behind *in utero* embryonic development, MYH6, BMP7, HOPX and HEY2, are not embryonic in the context of this analysis. They represent a well-documented phenomenon in hearth failure called fetal gene reprogramming. As the failing heart loses normal function, it down regulates genes that are essential for maintaining mature cardiomyocytes, which also happen during fetal cardiac development.
+
+```{r}
+#| label: pathway_enrichment
+
+# Seperate the 50 DEGs into upregulated and downregulated groups
+up_genes <- results_df %>%
+  filter(padj < 0.05, log2FoldChange > 1) %>%
+  pull(gene_id)
+
+down_genes <- results_df %>%
+  filter(padj < 0.05, log2FoldChange < -1) %>%
+  pull(gene_id)
+
+# Convert Ensembl IDs into Entrez IDs for clusterProfiler
+up_entrez <- bitr(up_genes,
+                  fromType = "ENSEMBL",
+                  toType = "ENTREZID",
+                  OrgDb = org.Hs.eg.db)
+
+down_entrez <- bitr(down_genes,
+                  fromType = "ENSEMBL",
+                  toType = "ENTREZID",
+                  OrgDb = org.Hs.eg.db)
+
+# GO enrichment for upregulated genes
+go_up <- enrichGO(gene = up_entrez$ENTREZID,
+                  OrgDb = org.Hs.eg.db,
+                  ont = "BP",
+                  pAdjustMethod = "BH",
+                  pvalueCutoff = 0.05,
+                  qvalueCutoff = 0.05,
+                  readable = TRUE)
+
+# GO enrichment for downregulated genes
+go_down <- enrichGO(gene = down_entrez$ENTREZID,
+                  OrgDb = org.Hs.eg.db,
+                  ont = "BP",
+                  pAdjustMethod = "BH",
+                  pvalueCutoff = 0.1,
+                  qvalueCutoff = 0.2,
+                  readable = TRUE)
+
+# Results summary
+cat("Enriched GO terms for Upregulated Genes:", nrow(go_up@result %>% filter(p.adjust < 0.05)), "\n")
+cat("Enriched GO terms for Downregulated Genes:", nrow(go_down@result %>% filter(p.adjust < 0.1)), "\n")
+```
+
+```{r}
+#| label: enrichment_plots_up
+
+# Dotplot for upregulated genes
+dotplot(go_up,
+        showCategory = 20,
+        title = "GO Biological Process: Upregulated in DCM",
+        font.size = 10)
+
+ggsave(here("results", "figures", "go_upregulated.png"),
+       width = 10, height = 7, dpi = 300)
+```
+
+```{r}
+#| label: enrichment_plots_down
+
+# Dotplot for downregulated genes
+dotplot(go_down,
+        showCategory = 20,
+        title = "GO Biological Process: Downregulated in DCM",
+        font.size = 10)
+
+ggsave(here("results", "figures", "go_downregulated.png"),
+       width = 10, height = 7, dpi = 300)
+```
+
+## Pathway Enrichment Analysis - KEGG
+
+KEGG pathway analysis complements GO by mapping DEGs onto specific molecular pathways. Among the upregulated genes, four pathways were significant (padj \< 0.05): TGF-beta signalling, cytoskeleton in muscle cells, protein digestion and absorption, and African trypanosomiasis.
+
+TGF-beta signalling is a key contributor of cardiac fibrosis and is directly connected to the ECM remodeling which was also identified by GO. The cytoskeleton pathway explains the structural changes in cardiomyocytes as the heart deteriorates. The protein digestion and absorption pathway contains collagen genes that are related to intestinal biology in the KEGG database. However, the underlying biology is ECM remodelling rather than digestion. Similarly, the African typanosomiasis pathway shares immune and inflammatory genes with the cardiac stress signalling pathways and is not biologically literal in this context.
+
+Among the downregulated genes, six pathways were significant (p-value \< 0.05). However, due to the smaller sample size of the reanalysis, these did not survive multiple testing corrections and will be reported as suggestive findings. Adrenergic signalling in cardiomyocytes and cardiac muscle contraction were the most biologically relevant pathways. Adrenergic signalling down regulation in DCM points to the receptor desensitization that happens after prolonged compensatory stress. It is the same mechanism that makes beta-blockers an effective treatment for heart failure. Cardiac muscle contraction pathway down regulation is consistent with the reduced pumping function that defines the disease. Metabolic pathway changes, pyruvate metabolism and glycerophospholipid metabolism, were also flagged as downregulated. They reflect the known shift in energy substrate use in failing hearts.
+
+```{r}
+#| label: kegg_enrichment
+
+# KEGG enrichment, upregulated genes
+kegg_up <- enrichKEGG(gene = up_entrez$ENTREZID,
+                      organism = "hsa",
+                      pAdjustMethod = "BH",
+                      pvalueCutoff = 0.05,
+                      qvalueCutoff = 0.05)
+
+# KEGG enrichment, downregulated genes
+kegg_down <- enrichKEGG(gene = down_entrez$ENTREZID,
+                      organism = "hsa",
+                      pAdjustMethod = "BH",
+                      pvalueCutoff = 0.05,
+                      qvalueCutoff = 0.3)
+# Summary
+cat("Enriched KEGG Pathways, Upregulated:",
+    nrow(kegg_up@result %>%
+           filter(p.adjust < 0.05)), "\n")
+cat("Enriched KEGG Pathways, Downregulated:",
+    nrow(kegg_down@result %>%
+           filter(pvalue < 0.05)), "\n")
+```
+
+```{r}
+#| label: kegg_plots
+
+# Upregulated KEGG pathway dotplot, prep
+kegg_up_df <- kegg_up@result %>%
+  filter(p.adjust < 0.05) %>%
+  arrange(p.adjust) %>%
+  mutate(
+    Description = fct_reorder(Description, Count),
+    GeneRatio_numeric = sapply(GeneRatio, function(x) {
+      parts <- strsplit(x, "/") [[1]]
+      as.numeric(parts[1]) / as.numeric(parts[2])
+    })
+  )
+
+# Upregulated KEGG dotplot
+ggplot(kegg_up_df,
+       aes(x = GeneRatio_numeric,
+           y = Description,
+           size = Count,
+           color = p.adjust)) +
+  geom_point() +
+  scale_color_gradient(low = "#E64B35", high = "#4DBBD5") +
+  scale_size_continuous(range = c(3,8)) +
+  labs(
+    title = "KEGG Pathways Upregulated in DCM",
+    x = "Gene Ratio",
+    y = NULL,
+    color = "Adjusted P-value",
+    size = "Gene Count"
+  ) +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 10))
+
+ggsave(here("results", "figures", "kegg_upregulated.png"),
+       width = 10, height = 7, dpi = 300)
+
+# Downregulated KEGG pathway dotplot, prep
+kegg_down_df <- kegg_down@result %>%
+  filter(pvalue < 0.05) %>%
+  arrange(pvalue) %>%
+  mutate(
+    Description = fct_reorder(Description, Count),
+    GeneRatio_numeric = sapply(GeneRatio, function(x) {
+      parts <- strsplit(x, "/") [[1]]
+      as.numeric(parts[1]) / as.numeric(parts[2])
+    })
+  )
+
+# Downregulated KEGG dotplot
+ggplot(kegg_down_df,
+       aes(x = GeneRatio_numeric,
+           y = Description,
+           size = Count,
+           color = pvalue)) +
+  geom_point() +
+  scale_color_gradient(low = "#E64B35", high = "#4DBBD5") +
+  scale_size_continuous(range = c(3,8)) +
+  labs(
+    title = "KEGG Pathways Downregulated in DCM",
+    subtitle = "Nominal p < 0.05, not corrected for multiple testing",
+    x = "Gene Ratio",
+    y = NULL,
+    color = "P-value",
+    size = "Gene Count"
+  ) +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 10))
+
+ggsave(here("results", "figures", "kegg_downregulated.png"),
+       width = 10, height = 7, dpi = 300)
+```
+
+## Comparison to Published Work
+
+Despite the differences in analytical methods and sample size, the findings of this reanalysis are in line with those of the original work (Sweet et al. 2018) and other published work using the same data set (GSE116250).
+
+Sweet et al. identified MYH6 down regulation, fetal gene reprogramming, and cell adhesion & ECM dysregulation as primary features of DCM, all of which are also identified in this reanalysis. The differences in the number of DEGs identified (1,656 here versus 3,495 in the original study) are expected since the sample size is smaller here and a different statistical framework is used.
+
+Portokallidou et al. 2023 (Frontiers in Cardiovascular Medicine) used DESeq2 on GSE116250 as part of a multi-omics integration study. Their DCM findings included MYH6 as one of ten cross-validated genes confirmed at both transcriptomic and proteomic levels, and identified ECM organisation and TGF-beta signalling as the most significantly enriched pathways, in line with the findings of this reanalysis. 
+
+These findings related to ECM organisation and TGF-beta signalling across three independent analyses, using different tools, different sample selections, and different pathway databases, provides strong evidence that the findings of this reanalysis reflect genuine and reproducible biology.
+
+```{r}
+#| label: session_info
+
+sessionInfo()
+```
