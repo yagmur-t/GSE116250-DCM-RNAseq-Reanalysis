@@ -2,6 +2,7 @@
 title: "GSE116250 Dilated Cardiomyopathy RNA-seq Reanalysis"
 format: 
   html:
+    embed-resources: true
     toc: true
     toc-depth: 3
     code-fold: true
